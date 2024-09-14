@@ -1,0 +1,99 @@
+Ja, das ist durchaus möglich! Prometheus eignet sich hervorragend zur Erfassung und Überwachung von Metriken, einschließlich Sensordaten. Du kannst in deinem Fall die Temperaturdaten über ein Node.js-Skript erfassen und sie Prometheus zur Verfügung stellen, damit dieser sie abruft und speichert. Lass uns das Schritt für Schritt durchgehen.
+
+### 1. **Was ist Prometheus?**
+Prometheus ist ein Open-Source-System für die Überwachung und Alarmierung. Es ist für die Speicherung und Abfrage von Metriken in Zeitreihen konzipiert und funktioniert am besten mit Anwendungen, die ihre Metriken im "Pull"-Modell zur Verfügung stellen.
+
+- **Pull-Modell:** Prometheus ruft in regelmäßigen Intervallen (z.B. jede Minute) Daten von sogenannten "Exporter"-Endpoints (in deinem Fall das Node.js-Skript) ab.
+- **Push-Modell (optional):** Es gibt auch die Möglichkeit, Daten an Prometheus zu "pushen", indem man den `Pushgateway` verwendet. Dies wird in Fällen genutzt, in denen das Pull-Modell nicht praktikabel ist.
+
+### 2. **Überblick über die Lösung**
+- Ein Prometheus-Container wird aufgesetzt.
+- Ein Node.js-Skript wird erstellt, das die Sensordaten sammelt und einen HTTP-Endpoint bereitstellt. Prometheus kann diesen Endpoint dann regelmäßig abfragen, um die Metriken zu erfassen.
+
+### 3. **Prometheus Container aufsetzen**
+Du kannst Prometheus mit Docker starten. Erstelle zunächst eine `prometheus.yml` Konfigurationsdatei, die Prometheus mitteilt, welche Endpoints abgerufen werden sollen.
+
+#### `prometheus.yml` Beispielinhalt:
+```yaml
+global:
+  scrape_interval: 60s  # Abfrage-Intervall (jede Minute)
+
+scrape_configs:
+  - job_name: 'temperature_sensor'
+    static_configs:
+      - targets: ['host.docker.internal:3001']  # Der Node.js-Server, der die Metriken bereitstellt
+```
+> **Hinweis:** `host.docker.internal` ist eine spezielle Adresse, die vom Docker-Host aus zugänglich ist. Verwende sie, wenn das Node.js-Skript auf dem Hostsystem läuft und der Prometheus-Container darauf zugreifen muss.
+
+#### Prometheus Container starten:
+Erstelle einen Docker-Container für Prometheus:
+```bash
+docker run -d --name=prometheus -p 9090:9090 -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
+```
+- `-v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml`: Bindet die lokale Konfigurationsdatei ins Prometheus-Containerverzeichnis ein.
+- `-p 9090:9090`: Exponiert den Port 9090, auf dem Prometheus zugänglich ist.
+
+### 4. **Node.js-Anwendung als Exporter erstellen**
+Erstelle ein einfaches Node.js-Skript, das als HTTP-Endpoint für die Sensordaten dient. Es wird einen `/metrics`-Endpoint bereitstellen, den Prometheus abfragen kann.
+
+#### Beispiel-Node.js-Skript (`temperature_exporter.js`):
+Installiere zunächst das `express`-Paket und das `prom-client`-Paket:
+```bash
+npm install express prom-client
+```
+
+Erstelle dann das folgende Skript:
+
+```javascript
+const express = require('express');
+const client = require('prom-client');
+
+const app = express();
+const port = 3001;
+
+// Erstelle einen Prometheus-Gauge, um die Temperatur zu speichern
+const temperatureGauge = new client.Gauge({
+  name: 'sensor_temperature_celsius',
+  help: 'Temperature measured by the sensor in Celsius'
+});
+
+// Simuliere das Erfassen von Sensordaten und aktualisiere die Temperatur-Metrik
+setInterval(() => {
+  const simulatedTemperature = 20 + Math.random() * 10; // Beispiel: zufällige Temperatur zwischen 20 und 30
+  temperatureGauge.set(simulatedTemperature);
+}, 60000); // Aktualisiere jede Minute
+
+// Prometheus-Metrics-Endpoint
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+// Starte den Server
+app.listen(port, () => {
+  console.log(`Temperature exporter listening on port ${port}`);
+});
+```
+
+Speichere dieses Skript als `temperature_exporter.js` und starte es:
+```bash
+node temperature_exporter.js
+```
+
+### 5. **Prometheus-Konfiguration anpassen**
+Stelle sicher, dass der `prometheus.yml`-Eintrag korrekt auf den Node.js-Server (`host.docker.internal:3001`) verweist. In deinem Fall verwendet Prometheus den `/metrics`-Endpoint, um die Temperaturdaten abzurufen.
+
+### 6. **Überprüfen**
+- Besuche `http://localhost:9090` in deinem Browser, um auf das Prometheus-Webinterface zuzugreifen.
+- Suche in der Prometheus-Web-UI nach `sensor_temperature_celsius`, um die erfassten Sensordaten zu überprüfen.
+
+### 7. **Zusammenfassung**
+- **Node.js-Skript:** Erfasst Sensordaten und stellt sie unter `/metrics` im Prometheus-Format bereit.
+- **Prometheus:** Fragt regelmäßig den `/metrics`-Endpoint des Node.js-Skripts ab, um die Temperaturdaten zu erfassen.
+- **Konfiguration:** Die Konfigurationsdatei `prometheus.yml` teilt Prometheus mit, wo es die Metriken abfragen soll.
+
+### 8. **Nächste Schritte**
+- **Daten in Grafana visualisieren:** Du kannst nun Grafana so konfigurieren, dass es Prometheus als Datenquelle verwendet, um die Temperaturdaten zu visualisieren.
+- **Push-Modell:** Wenn das Pull-Modell nicht geeignet ist (z.B. bei sehr unregelmäßigen Messungen), kannst du auch den `Pushgateway` von Prometheus nutzen, um die Metriken "push"-basiert an Prometheus zu senden.
+
+Mit dieser Einrichtung hast du eine solide Grundlage, um Sensordaten in Prometheus zu speichern und anschließend in Grafana zu visualisieren.
