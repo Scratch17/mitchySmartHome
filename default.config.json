@@ -1,0 +1,6 @@
+{
+    "sprinklerTimes": ["12:00", "18:00", "22:00"],
+    "sprinkleLengthMS": 15000,
+    "lightStart": "10:00",
+    "lightEnd": "22:00"
+}

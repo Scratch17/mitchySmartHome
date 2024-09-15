@@ -1,8 +1,12 @@
-import { promises as fs } from 'fs'
+import fs from 'fs'
+import { promises as afs } from 'fs'
 import path from 'path'
 
+import cron from 'node-cron'
 import { Gpio } from 'onoff'
 import mqtt from 'mqtt'
+
+import config from './config.json' with { type: 'json' }
 
 const GPIO_PIN_MAPPING = {
   2: 514,
@@ -33,16 +37,30 @@ const GPIO_PIN_MAPPING = {
   27: 539,
 }
 const THIS_MQTT_SENDER = 'Terrarium'
-const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://192.168.0.25'
-const MQTT_SPRINKLER_TOPIC = process.env.MQTT_SPRINKLER_TOPIC ?? 'terrarium/regenanlage' //? bekommt 1 oder 0 um sie an oder aus zu schalten. wenn eigeschaltet wird: nach max. 15s wieder ausschalten sowie setzen neuer Zeitpläne
-const MQTT_TEMPERATURE_TOPIC = process.env.MQTT_TEMPERATURE_TOPIC ?? 'terrarium/temperatur'
-const MQTT_LIGHT_TOPIC = process.env.MQTT_LIGHT_TOPIC ?? 'terrarium/licht' //? zum AN und AUS schalten sowie setzen neuer Zeitpläne
+const MQTT_BROKER_URL = 'mqtt://192.168.0.25'
+const MQTT_SPRINKLER_TOPIC = 'terrarium/regenanlage' //? bekommt 1 oder 0 um sie an oder aus zu schalten. wenn eigeschaltet wird: nach max. 15s wieder ausschalten sowie setzen neuer Zeitpläne
+const MQTT_TEMPERATURE_TOPIC = 'terrarium/temperatur'
+const MQTT_LIGHT_TOPIC = 'terrarium/licht' //? zum AN und AUS schalten sowie setzen neuer Zeitpläne
+const MQTT_SETTINGS_TOPIC = 'terrarium/settings'
 
 const SENSOR_TEMP_INSIDE = '/sys/bus/w1/devices/28-357f541f64ff/w1_slave'
 const SENSOR_TEMP_OUTSIDE = '/sys/bus/w1/devices/28-e978541f64ff/w1_slave'
 
+let sprinklerTimes = config.sprinklerTimes
+let sprinkleLengthMS = config.sprinkleLengthMS
+let lightStart = config.lightStart
+let lightEnd = config.lightEnd
+
 const sprinkler = new Gpio(GPIO_PIN_MAPPING[4], 'out')
 const client = mqtt.connect(MQTT_BROKER_URL)
+
+const timeSchedules = {
+  SPRINKLER: [],
+  LIGHT: {
+    start: null,
+    end: null,
+  },
+}
 
 const publishResponse = (topic, message) => {
   client.publish(
@@ -61,6 +79,15 @@ const publishResponse = (topic, message) => {
   )
 }
 
+const timeToCron = time => {
+  const timePattern = /^([01]?[0-9]|2[0-3]):([0-5][0-9])$/
+  if (!timePattern.test(time)) {
+    throw new Error(`Invalid time format: ${time}. Please use hh:mm in 24h format`)
+  }
+  const [hours, minutes] = time.split(':')
+  return `${minutes} ${hours} * * *`
+}
+
 const processMessage = (message, topic) => {
   try {
     const messageObject = JSON.parse(message)
@@ -72,12 +99,13 @@ const processMessage = (message, topic) => {
     const errMessage = `Ivalid Message "${message}": ${err}`
     console.error(errMessage)
     publishResponse(topic, errMessage)
+    return {}
   }
 }
 
 const readTemperature = async sensorFile => {
   try {
-    const rawData = await fs.readFile(sensorFile, 'utf8')
+    const rawData = await afs.readFile(sensorFile, 'utf8')
     const lines = rawData.split('\n')
     if (lines[0].includes('YES')) {
       const tempIndex = lines[1].indexOf('t=')
@@ -97,31 +125,150 @@ const readTemperature = async sensorFile => {
   return null
 }
 
+const unsetSchedule = subject => {
+  switch (subject) {
+    case 'SPRINKLER':
+      for (const cronJob of timeSchedules[subject]) {
+        cronJob.stop()
+      }
+      timeSchedules[subject] = []
+      break
+    case 'LIGHT':
+      timeSchedules[subject].start.stop()
+      timeSchedules[subject].end.stop()
+      timeSchedules[subject].start = null
+      timeSchedules[subject].end = null
+      break
+    default:
+      console.error(`subject ${subject} not found in timeSchedules`)
+  }
+}
+
+const initSprinklerSchedule = () => {
+  for (const time of sprinklerTimes) {
+    const cronTime = timeToCron(time)
+    const cronJob = cron.schedule(
+      cronTime,
+      () => {
+        let message = ''
+        sprinkler.writeSync(1)
+        message = 'Start sprinkling'
+        console.log(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        setTimeout(() => {
+          sprinkler.writeSync(0)
+          message = 'Stop sprinkling'
+          console.log(message)
+          publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        }, sprinkleLengthMS)
+      },
+      { scheduled: true }
+    )
+    timeSchedules.SPRINKLER.push(cronJob)
+    console.log(`Initiated sprinkler job for ${time}`)
+  }
+}
+
+const initLightSchedule = () => {}
+
+const setSprinklerSchedule = times => {
+  unsetSchedule('SPRINKLER')
+  for (const time of times) {
+    const cronJob = cron.schedule(
+      time,
+      () => {
+        let message = ''
+        sprinkler.writeSync(1)
+        message = 'Start sprinkling'
+        console.log(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        setTimeout(() => {
+          sprinkler.writeSync(0)
+          message = 'Stop sprinkling'
+          console.log(message)
+          publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        }, sprinkleLengthMS)
+      },
+      { scheduled: true }
+    )
+    timeSchedules.SPRINKLER.push(cronJob)
+  }
+}
+
+const setLightSchedule = (startTime, endTime) => {}
+
 const executeSprinklerCommand = (command, time) => {
-  //todo: Möglichkeit Zeitpunkte hinzuzufügen, wann Regenanlage an gehen soll empty array soll resetten
   const gpioValue = parseInt(command)
-  if (gpioValue !== 1 && gpioValue !== 0) {
-    const errMessage = `Ivalid command value "${command}": "command" needs to be 1 or 0`
-    console.error(errMessage)
-    publishResponse(MQTT_SPRINKLER_TOPIC, errMessage)
-  } else {
-    sprinkler.writeSync(gpioValue)
-    let successMessage = `Set Sprinkler to ${gpioValue}`
-    console.log(successMessage)
-    publishResponse(MQTT_SPRINKLER_TOPIC, successMessage)
-    if (gpioValue === 1) {
+  let message = ''
+  switch (gpioValue) {
+    case 1:
+      sprinkler.writeSync(gpioValue)
+      message = 'Start sprinkling'
+      console.log(message)
+      publishResponse(MQTT_SPRINKLER_TOPIC, message)
       setTimeout(() => {
         sprinkler.writeSync(0)
-        successMessage = '15s over. Set Sprinkler to 0.'
-        console.log(successMessage)
-        publishResponse(MQTT_SPRINKLER_TOPIC, successMessage)
-      }, 15000)
-    }
+        message = 'Stop sprinkling'
+        console.log(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+      }, sprinkleLengthMS)
+      break
+    case 0:
+      sprinkler.writeSync(gpioValue)
+      message = 'Stop sprinkling'
+      console.log(message)
+      publishResponse(MQTT_SPRINKLER_TOPIC, message)
+      break
+    case -1:
+      if (!time) {
+        message = 'No times found to set'
+        console.error(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        break
+      }
+      if (!Array.isArray(time)) {
+        message = 'Invalid time value. time has to be an array with hh:mm format values'
+        console.error(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+        break
+      }
+      try {
+        const cronTimes = time.map(t => timeToCron(t))
+        setSprinklerSchedule(cronTimes)
+
+        // update settings
+        const newConfigData = JSON.parse(fs.readFileSync('./config.json', 'utf8'))
+        newConfigData.sprinklerTimes = time
+        fs.writeFileSync('./config.json', JSON.stringify(newConfigData, null, 2), 'utf8')
+        console.log('Updated config.json file')
+        sprinklerTimes = time
+
+        message = 'Successfully set new times'
+        console.log(message)
+        publishResponse(MQTT_SPRINKLER_TOPIC, message)
+      } catch (err) {
+        console.error(err)
+        publishResponse(MQTT_SPRINKLER_TOPIC, err.toString())
+      }
+      break
+    default:
+      message = `Ivalid command value "${command}": "command" needs to be 1 (on) or 0 (off) or -1 (setTime)`
+      console.error(message)
+      publishResponse(MQTT_SPRINKLER_TOPIC, message)
   }
 }
 
 const executeLightCommand = (command, time) => {
   //todo: fertigstellen
+  // let [startTime, endTime] = time
+  // startTime = timeToCron(startTime)
+  // endTime = timeToCron(endTime)
+  // if (!Array.isArray(time) && !time.length === 2) {
+  //   message = 'Invalid time value. time has to be an array with exactly 2 values: [startTime, endTime]'
+  //   console.error(message)
+  //   publishResponse(MQTT_SPRINKLER_TOPIC, message)
+  //   break
+  // }
 }
 
 const executeTemperatureCommand = async command => {
@@ -156,28 +303,36 @@ const executeTemperatureCommand = async command => {
 
 /**
  * Expected command formats:
- *  MQTT_SPRINKLER_TOPIC & MQTT_LIGHT_TOPIC:
+ *  MQTT_SPRINKLER_TOPIC:
  *  {"sender": "someSender", command: 1 or 0, time (optional): [04:00, 16:00]}
+ *  MQTT_LIGHT_TOPIC:
+ *  {"sender": "someSender", command: 1 or 0, time (optional): [04:00 (start), 16:00 (end)]}
  *  MQTT_TEMPERATURE_TOPIC:
  *  {"sender": "someSender", command: "getTempInside" or "getTempOutside"}
  */
 client.on('message', async (topic, message) => {
   const { sender, command, time } = processMessage(message, topic)
+  if (sender && sender === THIS_MQTT_SENDER) {
+    return
+  }
   switch (topic) {
     case MQTT_SPRINKLER_TOPIC:
-      if (sender && sender !== THIS_MQTT_SENDER) {
-        executeSprinklerCommand(command, time)
-      }
+      executeSprinklerCommand(command, time)
       break
     case MQTT_LIGHT_TOPIC:
-      if (sender && sender !== THIS_MQTT_SENDER) {
-        executeLightCommand(command, time)
-      }
+      executeLightCommand(command, time)
       break
     case MQTT_TEMPERATURE_TOPIC:
-      if (sender && sender !== THIS_MQTT_SENDER) {
-        await executeTemperatureCommand(command)
-      }
+      await executeTemperatureCommand(command)
+      break
+    case MQTT_SETTINGS_TOPIC:
+      publishResponse(MQTT_SETTINGS_TOPIC, {
+        sprinklerTimes: sprinklerTimes,
+        sprinkleLengthMS: sprinkleLengthMS,
+        lightStart: lightStart,
+        lightEnd: lightEnd,
+      })
+
       break
   }
 })
@@ -205,6 +360,13 @@ client.on('connect', () => {
       console.log(`Topic subscribed: ${MQTT_TEMPERATURE_TOPIC}`)
     }
   })
+  client.subscribe(MQTT_SETTINGS_TOPIC, err => {
+    if (err) {
+      console.error(`Fehler beim Subscribe des Topics ${MQTT_SETTINGS_TOPIC}:`, err)
+    } else {
+      console.log(`Topic subscribed: ${MQTT_SETTINGS_TOPIC}`)
+    }
+  })
 })
 
 process.on('SIGINT', () => {
@@ -213,4 +375,10 @@ process.on('SIGINT', () => {
   process.exit()
 })
 
-// todo: überlegen wie es als eigener Prozess immer im hintergrund laufen soll
+initSprinklerSchedule()
+initLightSchedule()
+
+//todos:
+//todo: 1. Licht
+//todo: 2. Zeiteinstellung für Licht
+//todo: 3. Prometheus aufsetzen und anbinden
