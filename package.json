@@ -10,6 +10,8 @@
   "description": "",
   "type": "module",
   "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
     "mqtt": "^5.10.1",
     "node-cron": "^3.0.3",
     "onoff": "^6.0.3"
